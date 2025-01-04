@@ -2,10 +2,11 @@ import asyncio
 from datetime import datetime
 from pyppeteer import launch
 import os
-from dotenv import load_dotenv
 import psycopg2
+import boto3
 
-load_dotenv()
+from dotenv import load_dotenv
+
 
 DAY_OF_WEEK_MAP = {
     1: 'Sun',
@@ -22,6 +23,22 @@ NEXT_WEEK_BUTTON_SELECTOR = (
     'border-2.border-kdvsblack.bg-kdvswhite.absolute.-right-1.translate-x-full'
 )
 
+def download_chromium():
+    s3_client = boto3.client('s3')
+    bucket_name = 'serverless-chromium'
+    object_key = 'chromium'
+
+    chromium_path = '/tmp/headless-chromium'
+
+    try:
+        print(f"Downloading Chromium binary from s3://{bucket_name}/{object_key} to {chromium_path}")
+        s3_client.download_file(bucket_name, object_key, chromium_path)
+        os.chmod('/tmp/headless-chromium', 0o755)
+        print("Chromium binary downloaded successfully.")
+    except Exception as e:
+        print(f"Error downloading Chromium: {e}")
+        raise e  # Re-raise the exception to halt the function if download fails
+
 async def close_browser(browser):
     for page in await browser.pages():
         await page.close()
@@ -35,10 +52,9 @@ def fallback_to_pkill():
     except Exception as e:
         print(f"Error while executing pkill: {e}")
 
-async def scrape_dj_name(browser, show_url):
-    """Scrape the DJ name from a show's page."""
+async def scrape_showSite(browser, show_url):
     if not show_url:
-        return "Unknown"
+        return "Unknown", False
 
     page = await browser.newPage()
     try:
@@ -54,11 +70,24 @@ async def scrape_dj_name(browser, show_url):
             const djLink = djElement.querySelector('a');
             return djLink ? djLink.innerText.trim() : djElement.innerText.trim();
         }''')
-        return dj_name or "Unknown"
+
+        # Check the first <li> element in the <ul> with class "timeslot show-schedule"
+        alternates = await page.evaluate('''() => {
+            const timeslotUl = document.querySelector('ul.timeslot.show-schedule');
+            if (!timeslotUl) return false;
+
+            const firstLi = timeslotUl.querySelector('li');
+            if (!firstLi) return false;
+
+            const text = firstLi.innerText || "";
+            return text.includes("Every other week") ? true : false;
+        }''')
+
+        return dj_name or "Unknown", alternates
 
     except Exception as e:
         print(f"Error scraping DJ name for URL {show_url}: {e}")
-        return "Unknown"
+        return "Unknown", False
 
     finally:
         await page.close()
@@ -72,8 +101,6 @@ async def scrape_schedule(page, todays_date):
         )
     except asyncio.TimeoutError:
         print("Timeout occurred while waiting for the schedule to load. Attempting to scrape remaining <a> tags.")
-
-    await page.screenshot({'path': "filename-{todays_date}.png", 'fullPage': True})
 
     dates = await page.evaluate('''() => {
         const dateElements = document.querySelectorAll('.grid-cols-7 .text-center p span');
@@ -189,9 +216,27 @@ async def scrape_schedule(page, todays_date):
 
 async def scrape_all_schedules():
     current_day = datetime.now()
+
+    download_chromium()
+    
+    chromium_path = '/tmp/headless-chromium'
+    if os.path.exists(chromium_path):
+        print("Chromium binary found. Launching browser...")
+    else:
+        print(f"Error: Chromium binary not found at {chromium_path}")
+
     browser = await launch(
         headless=True, 
-        args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
+        args=[
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        "--single-process",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        ],
+        executablePath="/tmp/headless-chromium",
+        userDataDir="/tmp",
     )
     page = await browser.newPage()
 
@@ -245,10 +290,10 @@ async def scrape_all_schedules():
                         'show_url': show['show_url']
                     })
         
-        # Scrape DJ names for each show
+        # Scrape DJ names+alternates for each show
         for show in all_shows:
             if show['show_url']:
-                show['dj_name'] = await scrape_dj_name(browser, show['show_url'])
+                show['dj_name'], show['alternates'] = await scrape_showSite(browser, show['show_url'])
 
 
     except Exception as e:
@@ -283,13 +328,17 @@ def save_to_database(shows):
 
         cursor = conn.cursor()
 
+        cursor.execute("DROP TABLE IF EXISTS temp_shows;")
+        cursor.execute("""
+            CREATE TABLE temp_shows (LIKE shows INCLUDING ALL);
+        """)
+
         for show in shows:
             formatted_dates = '{' + ','.join([f'"{date}"' for date in show['dates']]) + '}'
-
             cursor.execute(
                 """
-                INSERT INTO shows (name, dj_name, start_time, end_time, show_dates, playlist_image_url, current_dotw)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO temp_shows (name, dj_name, start_time, end_time, show_dates, playlist_image_url, current_dotw, alternates)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     show['showName'],
@@ -298,17 +347,27 @@ def save_to_database(shows):
                     show['endTime'],
                     formatted_dates,
                     show['image_url'], 
-                    show['current_dotw'] 
+                    show['current_dotw'],
+                    show['alternates']
                 )
             )
+
+        cursor.execute("BEGIN;")
+        cursor.execute("DROP TABLE shows;")
+        cursor.execute("ALTER TABLE temp_shows RENAME TO shows;")
+        cursor.execute("COMMIT;")
+
         conn.commit()
+        print("Database updated successfully!")
     except Exception as e:
         print(f"Error saving to database: {e}")
+        if conn:
+            conn.rollback()
     finally:
         if 'conn' in locals() and conn:
             conn.close()
 
-def lambda_handler(event=None, context=None):
+def lambda_handler(event, context):
     print("Starting scraping process...")
     shows = asyncio.run(scrape_all_schedules())
     print("Total Shows Scraped:", shows)
@@ -319,4 +378,5 @@ def lambda_handler(event=None, context=None):
         'body': f"Successfully saved {len(shows)} shows to the database."
     }
 
-lambda_handler()
+load_dotenv()
+lambda_handler(None, None)
