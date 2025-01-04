@@ -217,13 +217,13 @@ async def scrape_schedule(page, todays_date):
 async def scrape_all_schedules():
     current_day = datetime.now()
 
-    download_chromium()
+    # download_chromium()
     
-    chromium_path = '/tmp/headless-chromium'
-    if os.path.exists(chromium_path):
-        print("Chromium binary found. Launching browser...")
-    else:
-        print(f"Error: Chromium binary not found at {chromium_path}")
+    # chromium_path = '/tmp/headless-chromium'
+    # if os.path.exists(chromium_path):
+    #     print("Chromium binary found. Launching browser...")
+    # else:
+    #     print(f"Error: Chromium binary not found at {chromium_path}")
 
     browser = await launch(
         headless=True, 
@@ -231,12 +231,9 @@ async def scrape_all_schedules():
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-gpu',
-        "--single-process",
-        "--disable-dev-shm-usage",
-        "--no-zygote",
         ],
-        executablePath="/tmp/headless-chromium",
-        userDataDir="/tmp",
+        # executablePath="/tmp/headless-chromium",
+        # userDataDir="/tmp",
     )
     page = await browser.newPage()
 
